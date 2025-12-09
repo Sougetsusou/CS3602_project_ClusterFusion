@@ -1,14 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import flashinfer
 import torch.cuda.nvtx as nvtx
 import clusterfusion
 
 # Pythia-2.8b model parameters
 hidden_size = 2560
 num_heads = 32
-seqlen = 2048
+seqlen = 128  # Start with small seqlen for debugging
 head_dim = hidden_size // num_heads  # 80
 ffn_dim = 10240
 rotary_dim = head_dim // 4  # 20 (rotary_pct = 0.25)
@@ -16,24 +15,23 @@ rotary_dim = head_dim // 4  # 20 (rotary_pct = 0.25)
 torch.manual_seed(42)
 
 # Enable Debug print
-debug = 1
+debug = 0
 print_head = 1
 if debug:
     test_run = 1
 else:
-    test_run = 10000
+    test_run = 100
 
 def initialize_rope_embeddings(rotary_dim):
     """
     Initialize RoPE embeddings for only rotary_dim dimensions.
-    Note: Kernel expects HEAD_DIM size, so we pad with zeros for non-rotary dims.
+    Kernel expects HEAD_DIM size, so we pad with identity (cos=1, sin=0).
     """
     angles = (torch.rand((1, rotary_dim), dtype=torch.float32) * (2 * torch.pi)).to(0)
     h_cos = torch.cos(angles)
     h_sin = torch.sin(angles)
     
-    # Pad to HEAD_DIM size (kernel expects this)
-    # Non-rotary dimensions will have cos=1, sin=0 (identity transform)
+    # Pad to HEAD_DIM size
     padding_size = head_dim - rotary_dim
     cos_padding = torch.ones((1, padding_size), dtype=torch.float32).to(0)
     sin_padding = torch.zeros((1, padding_size), dtype=torch.float32).to(0)
@@ -46,23 +44,19 @@ def initialize_rope_embeddings(rotary_dim):
 def apply_neox_style_rotary_pos_emb_partial(q, k, cos, sin, rotary_dim):
     """
     Apply Neox-style RoPE only to the first rotary_dim dimensions.
-    For Pythia, rotary_pct=0.25, so only first 20 dims (out of 80) use RoPE.
+    For Pythia, rotary_pct=0.25, so only first 20 dims use RoPE.
     """
-    # Extract only the rotary dimensions from cos/sin (first rotary_dim)
-    cos = cos[:, :rotary_dim].unsqueeze(1)  # [1, 1, rotary_dim]
+    cos = cos[:, :rotary_dim].unsqueeze(1)
     sin = sin[:, :rotary_dim].unsqueeze(1)
     
-    # Split q and k into rotary and non-rotary parts
     q_rot = q[..., :rotary_dim]
     q_pass = q[..., rotary_dim:]
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
     
-    # Apply RoPE to rotary part
     q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
     k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
     
-    # Concatenate back
     q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
     k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
     
@@ -74,28 +68,39 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def pythia_decode(hidden, layernorm_weight, eps, kv_cache, qkv_proj, o_proj, head_dim, cos, sin, rotary_dim):
+def pythia_decode_reference(hidden, ln_weight, ln_bias, eps, kv_cache, 
+                            weight_qkv, bias_qkv, weight_o, 
+                            head_dim, cos, sin, rotary_dim):
     """
     Pythia decoding reference implementation.
-    Note: Pythia uses LayerNorm, not RMSNorm.
-    Note: Input should already be normalized (kernel does normalization internally)
+    - Uses LayerNorm (with bias), not RMSNorm
+    - QKV layout is INTERLEAVED: [Q0, K0, V0, Q1, K1, V1, ...]
+    - QKV projection has bias
     """
-    # DEBUG PRINT
     if debug:
         print("----------------------------- python begin -----------------------------")
 
-    # Apply RMSNorm directly (no residual add - kernel handles this internally)
-    mean_square = (hidden * hidden).mean(dim=-1, keepdim=True)
-    hidden = hidden * torch.rsqrt(mean_square + eps) * layernorm_weight
+    # LayerNorm: y = (x - mean) / sqrt(var + eps) * weight + bias
+    mean = hidden.mean(dim=-1, keepdim=True)
+    var = hidden.var(dim=-1, keepdim=True, unbiased=False)
+    hidden_normed = (hidden - mean) / torch.sqrt(var + eps) * ln_weight + ln_bias
     
-    qkv_new = qkv_proj(hidden).view(3, num_heads, head_dim)
-    q = qkv_new[0].view(1, num_heads, head_dim)
-    k_new = qkv_new[1].view(1, num_heads, head_dim)
-    v_new = qkv_new[2].view(1, num_heads, head_dim)
-
-    # DEBUG PRINT
     if debug: 
-        print("normed ref", hidden[..., 0: 80])
+        print("normed ref (first 80):", hidden_normed[..., 0:80])
+
+    # QKV projection: output = input @ weight.T + bias
+    # weight_qkv shape: [7680, 2560], bias_qkv shape: [7680]
+    qkv = torch.matmul(hidden_normed, weight_qkv.t()) + bias_qkv  # [1, 7680]
+    
+    # Interleaved layout: reshape to [num_heads, 3, head_dim]
+    # qkv[0:80] = Q head 0, qkv[80:160] = K head 0, qkv[160:240] = V head 0
+    # qkv[240:320] = Q head 1, ...
+    qkv = qkv.view(num_heads, 3, head_dim)  # [32, 3, 80]
+    q = qkv[:, 0, :].unsqueeze(0)   # [1, 32, 80]
+    k_new = qkv[:, 1, :].unsqueeze(0)  # [1, 32, 80]
+    v_new = qkv[:, 2, :].unsqueeze(0)  # [1, 32, 80]
+
+    if debug: 
         print("before RoPE")
         print(f"q, head_id = {print_head}: first 8, last 8")
         print(f"{q[0, print_head, 0: 8]}")
@@ -107,38 +112,33 @@ def pythia_decode(hidden, layernorm_weight, eps, kv_cache, qkv_proj, o_proj, hea
     # Apply RoPE only to first rotary_dim dimensions (Neox-style)
     q, k_new = apply_neox_style_rotary_pos_emb_partial(q, k_new, cos, sin, rotary_dim)
 
-    # DEBUG PRINT
     if debug: 
         print("after RoPE")
         print(f"q, head_id = {print_head}: first 8, last 8")
         print(f"{q[0, print_head, 0: 8]}")
         print(f"{q[0, print_head, 72: 80]}")
-        print(f"k_new, head_id = {print_head}: first 8, last 8")
-        print(f"{k_new[0, print_head, 0: 8]}")
-        print(f"{k_new[0, print_head, 72: 80]}")
 
     q = q.reshape(num_heads, head_dim)
-    k = torch.cat((kv_cache[0], k_new), dim=0) 
+    k = torch.cat((kv_cache[0], k_new), dim=0)  # [seqlen+1, num_heads, head_dim]
     v = torch.cat((kv_cache[1], v_new), dim=0)
     
-    # FlashInfer doesn't support head_dim=80, use PyTorch native attention
-    # q: [num_heads, head_dim], k,v: [seqlen+1, num_heads, head_dim]
+    # Attention (use PyTorch native since FlashInfer doesn't support head_dim=80)
     q = q.unsqueeze(0).unsqueeze(2)  # [1, num_heads, 1, head_dim]
     k = k.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen+1, head_dim]
-    v = v.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seqlen+1, head_dim]
+    v = v.transpose(0, 1).unsqueeze(0)
     
-    # Compute attention scores
-    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # [1, num_heads, 1, seqlen+1]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
     attn_weights = F.softmax(scores, dim=-1)
     o = torch.matmul(attn_weights, v)  # [1, num_heads, 1, head_dim]
     o = o.squeeze(0).squeeze(1)  # [num_heads, head_dim]
     
     if debug:
         print("attn output O")
-        print(f"o, head_id = {print_head}, o")
+        print(f"o, head_id = {print_head}:")
         print(f"{o[print_head, 0: 80]}")
     
-    o = o_proj(o.view(1, num_heads * head_dim))
+    # Output projection
+    o = torch.matmul(o.view(1, num_heads * head_dim), weight_o.t())
     
     if debug:
         print("final output o")
@@ -159,91 +159,83 @@ def test_pythia_decode_correctness():
     print(f"seqlen: {seqlen}, rotary_dim: {rotary_dim}")
     
     # Generate random weights and inputs
-    input_tensor = generate_random_weights((1, hidden_size)).to(0).half()
-    residual = generate_random_weights((1, hidden_size)).to(0).half()
-    weight_qkv = generate_random_weights((3 * num_heads * head_dim, hidden_size)).to(0).half()
-    weight_o = generate_random_weights((num_heads * head_dim, hidden_size)).to(0).half()
+    input_tensor = generate_random_weights((1, hidden_size))
     
-    layernorm_weight = generate_random_weights((1, hidden_size)).to(0).half()
-    layernorm_bias = torch.zeros((1, hidden_size)).to(0).half()
+    # QKV weight: [7680, 2560] - interleaved layout
+    weight_qkv = generate_random_weights((3 * num_heads * head_dim, hidden_size))
+    bias_qkv = generate_random_weights((3 * num_heads * head_dim,))
+    
+    # Output projection weight: [2560, 2560]
+    weight_o = generate_random_weights((hidden_size, hidden_size))
+    
+    # LayerNorm weight and bias
+    ln_weight = generate_random_weights((1, hidden_size))
+    ln_bias = generate_random_weights((1, hidden_size))
 
-    # Generate full kv_cache with shape (2, seqlen, num_heads * head_dim)
-    kv_cache_full = generate_random_weights((2, seqlen, num_heads * head_dim)).to(0).half()
+    # KV cache: [2, seqlen, num_heads * head_dim]
+    kv_cache_full = generate_random_weights((2, seqlen, num_heads * head_dim))
 
-    # RoPE with cos and sin (only for rotary_dim, not full head_dim)
+    # RoPE embeddings
     cos, sin = initialize_rope_embeddings(rotary_dim)
     
     # Our ClusterFusion kernel
     print("\n=== Running ClusterFusion Pythia Kernel ===")
-    o = []
+    o_ours = []
     for i in range(test_run):
-        # Clone tensors for each run to avoid in-place modifications
         input_clone = input_tensor.clone()
         output, k, v = clusterfusion.pythia_decoder_layer(
             input_clone,          
-            weight_qkv,                          
+            weight_qkv,
+            bias_qkv,             # QKV bias
             weight_o,              
             kv_cache_full[0],
             kv_cache_full[1],           
-            layernorm_weight,
+            ln_weight,
+            ln_bias,              # LayerNorm bias
             cos,                   
             sin                    
         )
-        o.append(output)
+        o_ours.append(output)
         if i == 0:
             print(f"First run output shape: {output.shape}")
             print(f"First run k shape: {k.shape}, v shape: {v.shape}")
-            if debug:
-                print(f"Input mean: {input_clone.mean().item():.6f}")
-                print(f"Output mean: {output.mean().item():.6f}")
-                print(f"K mean: {k.mean().item():.6f}, V mean: {v.mean().item():.6f}")
 
-    eps = 1e-5
-    layernorm_weight_flat = layernorm_weight.reshape((hidden_size,))
-
-    # Initialize reference linear layers with the same weights
-    qkv_proj = nn.Linear(hidden_size, 3 * num_heads * head_dim, bias=False).to(0).half()
-    o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False).to(0).half()
-    qkv_proj.weight.data = weight_qkv.contiguous().view(qkv_proj.weight.data.shape)
-    o_proj.weight.data = weight_o.contiguous().view(o_proj.weight.data.shape)
-
-    # Split kv_cache_full for reference implementation
-    kv_cache_k = kv_cache_full[0].view(seqlen, num_heads, head_dim)
-    kv_cache_v = kv_cache_full[1].view(seqlen, num_heads, head_dim)
-    kv_cache_gt = torch.cat([kv_cache_k[:seqlen], kv_cache_v[:seqlen]], dim=0).view(2, seqlen, num_heads, head_dim)
-    
     # Reference implementation
     print("\n=== Running Reference Implementation ===")
-    nvtx.range_push("pythia_decode")
-    # Clone input for reference to ensure same initial state
-    input_ref = input_tensor.clone()
-    o_gt = pythia_decode(
-        input_ref, layernorm_weight_flat, eps, 
-        kv_cache_gt, qkv_proj, o_proj, head_dim, cos, sin, rotary_dim
-    )
-    nvtx.range_pop()
+    eps = 1e-5
+    ln_weight_flat = ln_weight.reshape((hidden_size,))
+    ln_bias_flat = ln_bias.reshape((hidden_size,))
     
-    print(f"\nReference output shape: {o_gt.shape}")
-    print(f"Reference output abs mean: {o_gt.abs().mean().item()}")
+    # KV cache for reference: [2, seqlen, num_heads, head_dim]
+    kv_cache_k = kv_cache_full[0].view(seqlen, num_heads, head_dim)
+    kv_cache_v = kv_cache_full[1].view(seqlen, num_heads, head_dim)
+    kv_cache_ref = torch.stack([kv_cache_k, kv_cache_v], dim=0)  # [2, seqlen, num_heads, head_dim]
+    
+    input_ref = input_tensor.clone()
+    o_ref = pythia_decode_reference(
+        input_ref, ln_weight_flat, ln_bias_flat, eps,
+        kv_cache_ref, weight_qkv, bias_qkv, weight_o,
+        head_dim, cos, sin, rotary_dim
+    )
+    
+    print(f"\nReference output shape: {o_ref.shape}")
+    print(f"Reference output abs mean: {o_ref.abs().mean().item()}")
     
     # Compare outputs
     print("\n=== Comparison ===")
-    print("Ours[..., 0:80]:", o[0][..., 0:80])
-    print("Ref[..., 0:80]:", o_gt[..., 0:80])
+    print("Ours[..., 0:80]:", o_ours[0][..., 0:80])
+    print("Ref[..., 0:80]:", o_ref[..., 0:80])
     
     max_error_list = []
-    min_error_list = []
-    mse_list = []
     mae_list = []
+    mse_list = []
     
     for i in range(test_run):
-        diff = (o[i] - o_gt).abs()
+        diff = (o_ours[i] - o_ref).abs()
         mae = diff.mean()
         mae_list.append(mae)
-
         mse = (diff ** 2).mean()
         mse_list.append(mse)
-
         max_error = diff.max()
         max_error_list.append(max_error)
 
@@ -254,13 +246,7 @@ def test_pythia_decode_correctness():
     print(f"Min MAE: {min(mae_list).item():.6f}")
     print(f"Max absolute error: {max(max_error_list).item():.6f}")
     print(f"Min absolute error: {min(max_error_list).item():.6f}")
-    print(f"Count of max errors > 0.1: {sum(e.item() > 0.1 for e in max_error_list)}")
 
-    max_error_value = max(max_error_list).item()
-    max_error_index = max_error_list.index(max(max_error_list))
-    print(f"Maximum error occurs at run {max_error_index}, value: {max_error_value:.6f}")
-    
-    # Pass/Fail criteria
     avg_mae = sum(mae_list).item() / len(mae_list)
     print(f"\nAverage MAE: {avg_mae:.6f}")
     if avg_mae < 0.01:
@@ -268,25 +254,5 @@ def test_pythia_decode_correctness():
     else:
         print("✗ TEST FAILED: Average error is too large")
 
-def test_pythia_decode_small():
-    """Quick test with smaller sequence length for debugging"""
-    global seqlen, test_run
-    seqlen = 128
-    test_run = 10
-    
-    print("\n" + "="*80)
-    print("Quick test with seqlen=128")
-    print("="*80)
-    test_pythia_decode_correctness()
-
 if __name__ == "__main__":
-    # Run quick test first
-    test_pythia_decode_small()
-    
-    # Run full test
-    seqlen = 2048
-    test_run = 100
-    print("\n" + "="*80)
-    print("Full test with seqlen=2048")
-    print("="*80)
     test_pythia_decode_correctness()

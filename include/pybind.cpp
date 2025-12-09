@@ -108,10 +108,12 @@ void llama_decoder_layer_batch_sglang_sm120(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm120(
     torch::Tensor input,
     torch::Tensor weight_qkv,
+    torch::Tensor bias_qkv,           // QKV projection bias
     torch::Tensor weight_o,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
     torch::Tensor layernorm_weight,
+    torch::Tensor layernorm_bias,     // LayerNorm bias
     torch::Tensor cos,
     torch::Tensor sin
 );
