@@ -254,7 +254,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
     prompt = "The meaning of life is"
-    num_tokens = 20
+    num_tokens = 200
     
     # PyTorch implementation
     start = time.time()

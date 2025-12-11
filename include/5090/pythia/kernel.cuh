@@ -59,7 +59,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     // Init registers
     float local_sum = 0.0f, local_mean = 0.0f, eps = 1e-5f, var_rcp = 0.0f, tmp = 0.0f;
     float local_max = -CUDART_INF_F, pre_max = -CUDART_INF_F, scale = 0.0f;
-    float softmax_scale = __frsqrt_rn(HEAD_DIM) * 1.44269504088896340736f;
+    // Use precise softmax_scale: 1/sqrt(HEAD_DIM) * log2(e)
+    // For HEAD_DIM=80: 0.11180339887498948 * 1.44269504088896340736 = 0.16129820913429784
+    float softmax_scale = 0.16129820913429784f;
     half __align__(16) reg_input[NUM_PER_THREAD], reg_weight[NUM_PER_THREAD];
     float reg_reduce[NUM_PER_THREAD];
     float* dst_shmem;
@@ -475,15 +477,24 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
                 qk[j] += __shfl_xor_sync(0xffffffff, qk[j], mask);
             }
             qk[j] = qk[j] * softmax_scale;
-            local_max = max(local_max, qk[j]);
+            // Only update local_max for VALID positions (within SEQ_LEN)
+            int seq_idx = KV_DIM_PER_BLOCK * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j;
+            if (seq_idx < SEQ_LEN) {
+                local_max = max(local_max, qk[j]);
+            }
         }
-        scale = ptx_exp2(pre_max - local_max);
+        // Protect against -inf - (-inf) = nan when no valid positions
+        scale = (local_max > -CUDART_INF_F) ? ptx_exp2(pre_max - local_max) : 0.0f;
         local_sum *= scale;
         #pragma unroll
         for (int j = 0; j < DEC_TILE; j++) {
-            if ((KV_DIM_PER_BLOCK * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
+            int seq_idx = KV_DIM_PER_BLOCK * cluster_block_id + (id - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j;
+            if (seq_idx < SEQ_LEN) {
                 qk[j] = ptx_exp2(qk[j] - local_max);
                 local_sum += qk[j];
+            } else {
+                // Invalid position: set qk to 0 so it doesn't affect V weighting
+                qk[j] = 0.0f;
             }
         }
         #pragma unroll
@@ -533,15 +544,24 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
             qk[j] += __shfl_xor_sync(0xffffffff, qk[j], mask);
         }
         qk[j] = qk[j] * softmax_scale;
-        local_max = max(local_max, qk[j]);
+        // Only update local_max for VALID positions (within SEQ_LEN)
+        int seq_idx = KV_DIM_PER_BLOCK * cluster_block_id + (KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j;
+        if (seq_idx < SEQ_LEN) {
+            local_max = max(local_max, qk[j]);
+        }
     }
-    scale = ptx_exp2(pre_max - local_max);
+    // Protect against -inf - (-inf) = nan when no valid positions
+    scale = (local_max > -CUDART_INF_F) ? ptx_exp2(pre_max - local_max) : 0.0f;
     local_sum *= scale;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
-        if ((KV_DIM_PER_BLOCK * cluster_block_id + (KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j) < SEQ_LEN) {
+        int seq_idx = KV_DIM_PER_BLOCK * cluster_block_id + (KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) * TMA_LOAD_ONCE_ATTN + weight_idx_2 + j;
+        if (seq_idx < SEQ_LEN) {
             qk[j] = ptx_exp2(qk[j] - local_max);
             local_sum += qk[j];
+        } else {
+            // Invalid position: set qk to 0 so it doesn't affect V weighting
+            qk[j] = 0.0f;
         }
     }
     #pragma unroll
@@ -588,7 +608,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         if (lane_id / NUM_THREAD_PER_ROW_2 == 1) {
             qk[0] = qk[0] * softmax_scale;
             local_max = max(local_max, qk[0]); 
-            scale = ptx_exp2(pre_max - local_max);
+            // Protect against -inf - (-inf) = nan when no previous valid positions
+            scale = (pre_max > -CUDART_INF_F) ? ptx_exp2(pre_max - local_max) : 0.0f;
             local_sum *= scale;
             qk[0] = ptx_exp2(qk[0] - local_max);
             local_sum += qk[0];
@@ -623,7 +644,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     block.sync();
     for(int i = 0; i < NUM_PER_THREAD; i++)
         reg_reduce[i] = 0.0f;
-    local_sum = 0.0, local_max = 0.0;
+    local_sum = 0.0f;
+    local_max = -CUDART_INF_F;  // Must reset to -inf for correct max reduction
     #pragma unroll
     for(int j = 0; j < DIM_BLOCK_REDUCE / 2; j++) {
         // Bounds check for reading from shared memory
@@ -635,12 +657,14 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         float m = reduction[j * 2], s = reduction[j * 2 + 1];
         pre_max = local_max;
         local_max = max(m, local_max);
-        scale = ptx_exp2(m - local_max);
+        // Protect against -inf - (-inf) = nan
+        scale = (m > -CUDART_INF_F && local_max > -CUDART_INF_F) ? ptx_exp2(m - local_max) : 0.0f;
         s *= scale;
-        local_sum = local_sum * ptx_exp2(pre_max - local_max) + s;
+        float rescale = (pre_max > -CUDART_INF_F && local_max > -CUDART_INF_F) ? ptx_exp2(pre_max - local_max) : 0.0f;
+        local_sum = local_sum * rescale + s;
         #pragma unroll
         for (int d = 0; d < NUM_PER_THREAD; d++) {
-            reg_reduce[d] = reg_reduce[d] * ptx_exp2(pre_max - local_max) + __half2float(reg_input[d]) * scale;
+            reg_reduce[d] = reg_reduce[d] * rescale + __half2float(reg_input[d]) * scale;
         }
     }
     block.sync();
@@ -663,7 +687,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
         cluster.sync();
     }
-    scale = ptx_exp2(pre_max - cluster_local_max);
+    // Protect against -inf - (-inf) = nan
+    scale = (pre_max > -CUDART_INF_F && cluster_local_max > -CUDART_INF_F) ? ptx_exp2(pre_max - cluster_local_max) : 0.0f;
     local_sum *= scale;
     #pragma unroll
     for (int j = 0; j < NUM_PER_THREAD; j++) {
@@ -686,7 +711,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
         cluster.sync();
     }
-    // Add epsilon to prevent division by zero when all exp values underflow
+    // Add small epsilon to prevent division by zero (when all exp values underflow)
     float safe_sum = cluster_local_sum + 1e-10f;
     #pragma unroll
     for (int j = 0; j < NUM_PER_THREAD; j++) {

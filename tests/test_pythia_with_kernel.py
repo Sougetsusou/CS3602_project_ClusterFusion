@@ -11,13 +11,25 @@ import time
 MODEL_NAME = "EleutherAI/pythia-2.8b"
 
 def compute_rope_embeddings(position, rotary_dim, head_dim, base=10000, device='cuda:0'):
-    """Compute RoPE embeddings matching HuggingFace"""
+    """
+    Compute RoPE embeddings matching HuggingFace.
+    Kernel expects HEAD_DIM size, so we pad with identity (cos=1, sin=0).
+    """
     inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim))
     position_tensor = torch.tensor([position], dtype=torch.float32, device=device)
     freqs = torch.outer(position_tensor, inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)
     cos = emb.cos()
     sin = emb.sin()
+    
+    # Pad to HEAD_DIM size with identity (cos=1, sin=0)
+    padding_size = head_dim - rotary_dim
+    cos_padding = torch.ones((1, padding_size), dtype=torch.float32, device=device)
+    sin_padding = torch.zeros((1, padding_size), dtype=torch.float32, device=device)
+    
+    cos = torch.cat([cos, cos_padding], dim=-1)
+    sin = torch.cat([sin, sin_padding], dim=-1)
+    
     return cos, sin
 
 def generate_with_kernel(model, tokenizer, prompt, num_new_tokens=20):
