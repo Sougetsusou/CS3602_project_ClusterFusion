@@ -201,6 +201,14 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
+    # Warmup: run one decode to trigger CUDA kernel JIT compilation
+    print("Warming up...")
+    warmup_state = prepare_setup(model, tokenizer, PROMPT, 8)
+    decode_clusterfusion(model, PROMPT, 8, warmup_state)
+    decode_hf(model, warmup_state["input_ids"], 8)
+    torch.cuda.synchronize()
+    print()
+
     results = []
     for num_tokens in TOKEN_COUNTS:
         state = prepare_setup(model, tokenizer, PROMPT, num_tokens)
