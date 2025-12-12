@@ -12,6 +12,9 @@ MODEL_NAME = "EleutherAI/pythia-2.8b"
 TOKEN_COUNTS = [16, 32, 64, 128, 256, 512, 1024, 2048]
 PROMPT = "The meaning of life is"
 
+# Check if torch.compile is available
+TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
+
 
 def compute_rope_embeddings(position, rotary_dim, head_dim, base=10000, device="cuda:0"):
     inv_freq = 1.0 / (
@@ -31,6 +34,27 @@ def compute_rope_embeddings(position, rotary_dim, head_dim, base=10000, device="
     cos = torch.cat([cos, torch.ones((1, padding_size), device=device)], dim=-1)
     sin = torch.cat([sin, torch.zeros((1, padding_size), device=device)], dim=-1)
     return cos, sin
+
+
+def precompute_rope_embeddings(max_position, rotary_dim, head_dim, base=10000, device="cuda:0"):
+    """Precompute all RoPE embeddings up to max_position."""
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            / rotary_dim
+        )
+    )
+    positions = torch.arange(0, max_position, dtype=torch.float32, device=device)
+    freqs = torch.outer(positions, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    # pad to HEAD_DIM
+    padding_size = head_dim - rotary_dim
+    cos = torch.cat([cos, torch.ones((max_position, padding_size), device=device)], dim=-1)
+    sin = torch.cat([sin, torch.zeros((max_position, padding_size), device=device)], dim=-1)
+    return cos, sin  # [max_position, head_dim]
 
 
 def prepare_setup(model, tokenizer, prompt, num_new_tokens):
@@ -95,7 +119,7 @@ def prepare_setup(model, tokenizer, prompt, num_new_tokens):
     }
 
 
-def decode_clusterfusion(model, prompt, num_new_tokens, state):
+def decode_clusterfusion(model, prompt, num_new_tokens, state, use_cuda_graph=False):
     device = next(model.parameters()).device
     num_layers = len(model.gpt_neox.layers)
     num_heads = 32
@@ -113,13 +137,19 @@ def decode_clusterfusion(model, prompt, num_new_tokens, state):
         for (k, v, cur_len) in state["kv_caches"]
     ]
 
+    # Precompute all RoPE embeddings
+    max_position = prompt_length + num_new_tokens
+    all_cos, all_sin = precompute_rope_embeddings(max_position, rotary_dim, head_dim, device=device)
+
     torch.cuda.synchronize()
     start = time.time()
     with torch.no_grad():
         for step in range(num_new_tokens - 1):
             current_position = prompt_length + step
             hidden_states = model.gpt_neox.embed_in(next_token).half().squeeze(1)
-            cos, sin = compute_rope_embeddings(current_position, rotary_dim, head_dim, device=device)
+            # Use precomputed RoPE
+            cos = all_cos[current_position:current_position+1]
+            sin = all_sin[current_position:current_position+1]
 
             for layer_idx in range(num_layers):
                 weights = all_weights[layer_idx]
@@ -160,6 +190,101 @@ def decode_clusterfusion(model, prompt, num_new_tokens, state):
 
     torch.cuda.synchronize()
     decode_time = time.time() - start
+    return decode_time, generated_ids
+
+
+def decode_clusterfusion_graph_context(model, prompt, num_new_tokens, state):
+    """
+    Decode using pre-created graph contexts (TensorMaps created once).
+    This reduces CPU overhead by reusing TensorMaps across steps.
+    """
+    device = next(model.parameters()).device
+    num_layers = len(model.gpt_neox.layers)
+    head_dim = 80
+    hidden_size = 2560
+    rotary_dim = 20
+
+    next_token = state["first_token"]
+    generated_ids = [next_token.item()]
+    prompt_length = state["prompt_length"]
+    all_weights = state["all_weights"]
+    kv_caches = [
+        (k.clone(), v.clone(), cur_len)
+        for (k, v, cur_len) in state["kv_caches"]
+    ]
+
+    # Precompute all RoPE embeddings
+    max_position = prompt_length + num_new_tokens
+    all_cos, all_sin = precompute_rope_embeddings(max_position, rotary_dim, head_dim, device=device)
+
+    # Create graph contexts for all layers (one-time TensorMap creation)
+    max_seq_len = prompt_length + num_new_tokens
+    for layer_idx in range(num_layers):
+        weights = all_weights[layer_idx]
+        k_cache_full, v_cache_full, _ = kv_caches[layer_idx]
+        clusterfusion.pythia_create_graph_context(
+            layer_idx,  # context_id
+            k_cache_full,
+            v_cache_full,
+            weights["qkv_weight"],
+            weights["o_weight"],
+            weights["mlp_up_weight"],
+            weights["mlp_down_weight"],
+            max_seq_len,
+        )
+
+    torch.cuda.synchronize()
+    start = time.time()
+    with torch.no_grad():
+        for step in range(num_new_tokens - 1):
+            current_position = prompt_length + step
+            hidden_states = model.gpt_neox.embed_in(next_token).half().squeeze(1)
+            cos = all_cos[current_position:current_position+1]
+            sin = all_sin[current_position:current_position+1]
+
+            for layer_idx in range(num_layers):
+                weights = all_weights[layer_idx]
+                k_cache_full, v_cache_full, current_len = kv_caches[layer_idx]
+
+                output, _, _ = clusterfusion.pythia_graph_decode_step(
+                    layer_idx,  # context_id
+                    hidden_states,
+                    weights["ln_weight"],
+                    weights["ln_bias"],
+                    weights["qkv_bias"],
+                    weights["o_bias"],
+                    cos,
+                    sin,
+                    k_cache_full,
+                    v_cache_full,
+                    weights["post_ln_weight"],
+                    weights["post_ln_bias"],
+                    weights["mlp_up_bias"],
+                    weights["mlp_down_bias"],
+                    current_len,
+                )
+                # Clone because output is a static buffer that will be overwritten
+                hidden_states = output.clone()
+                kv_caches[layer_idx] = (k_cache_full, v_cache_full, current_len + 1)
+
+            hidden_states = torch.nn.functional.layer_norm(
+                hidden_states,
+                (hidden_size,),
+                model.gpt_neox.final_layer_norm.weight.data,
+                model.gpt_neox.final_layer_norm.bias.data,
+                eps=1e-5,
+            )
+            logits = model.embed_out(hidden_states)
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            generated_ids.append(next_token.item())
+
+    torch.cuda.synchronize()
+    decode_time = time.time() - start
+
+    # Clean up contexts
+    for layer_idx in range(num_layers):
+        clusterfusion.pythia_destroy_graph_context(layer_idx)
+
     return decode_time, generated_ids
 
 
@@ -213,26 +338,33 @@ def main():
     for num_tokens in TOKEN_COUNTS:
         state = prepare_setup(model, tokenizer, PROMPT, num_tokens)
         cf_time, ids_kernel = decode_clusterfusion(model, PROMPT, num_tokens, state)
+        
+        # Re-prepare state for graph context test (since KV caches are modified)
+        state2 = prepare_setup(model, tokenizer, PROMPT, num_tokens)
+        cf_graph_time, ids_graph = decode_clusterfusion_graph_context(model, PROMPT, num_tokens, state2)
+        
         hf_time, ids_hf = decode_hf(model, state["input_ids"], num_tokens)
 
         results.append(
             {
                 "tokens": num_tokens,
                 "cf_decode_s": cf_time,
+                "cf_graph_s": cf_graph_time,
                 "hf_decode_s": hf_time,
                 "speedup_cf": hf_time / cf_time if cf_time > 0 else float("inf"),
+                "speedup_graph": hf_time / cf_graph_time if cf_graph_time > 0 else float("inf"),
                 "match": ids_hf == (state["input_ids"][0].tolist() + ids_kernel),
-                "setup_s": state["setup_time"],
+                "match_graph": ids_hf == (state["input_ids"][0].tolist() + ids_graph),
             }
         )
 
     print("\n=== Decode Time (excluding setup) ===")
-    header = f"{'tokens':>8} | {'CF_fused(s)':>12} | {'HF(s)':>8} | {'spd_fused':>9} | {'match':>6} | {'setup':>8}"
+    header = f"{'tokens':>8} | {'CF(s)':>8} | {'CF_ctx(s)':>10} | {'HF(s)':>8} | {'spd_CF':>7} | {'spd_ctx':>7} | {'match':>6}"
     print(header)
     print("-" * len(header))
     for r in results:
         print(
-            f"{r['tokens']:8d} | {r['cf_decode_s']:12.3f} | {r['hf_decode_s']:8.3f} | {r['speedup_cf']:9.2f} | {str(r['match']):>6} | {r['setup_s']:8.3f}"
+            f"{r['tokens']:8d} | {r['cf_decode_s']:8.3f} | {r['cf_graph_s']:10.3f} | {r['hf_decode_s']:8.3f} | {r['speedup_cf']:7.2f} | {r['speedup_graph']:7.2f} | {str(r['match'] and r['match_graph']):>6}"
         )
 
 

@@ -127,6 +127,38 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     int64_t current_seq_len           // Current sequence length
 );
 
+// CUDA Graph support functions
+void pythia_create_graph_context_sm120(
+    int64_t context_id,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor weight_qkv,
+    torch::Tensor weight_o,
+    torch::Tensor mlp_up_weight,
+    torch::Tensor mlp_down_weight,
+    int64_t max_seq_len
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_graph_decode_step_sm120(
+    int64_t context_id,
+    torch::Tensor input,
+    torch::Tensor layernorm_weight,
+    torch::Tensor layernorm_bias,
+    torch::Tensor qkv_bias,
+    torch::Tensor o_bias,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor post_ln_weight,
+    torch::Tensor post_ln_bias,
+    torch::Tensor mlp_up_bias,
+    torch::Tensor mlp_down_bias,
+    int64_t current_seq_len
+);
+
+void pythia_destroy_graph_context_sm120(int64_t context_id);
+
 #ifdef COMPILE_SM90
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("llama_decoder_layer", &llama_decoder_layer_sm90, "");
@@ -142,5 +174,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("llama_decoder_layer_sglang", &llama_decoder_layer_sglang_sm120, "");
     m.def("llama_decoder_layer_batch_decode_sglang", &llama_decoder_layer_batch_sglang_sm120, "");
     m.def("pythia_decoder_layer", &pythia_decoder_layer_sm120, "");
+    // CUDA Graph support
+    m.def("pythia_create_graph_context", &pythia_create_graph_context_sm120, "Create static context for CUDA Graph");
+    m.def("pythia_graph_decode_step", &pythia_graph_decode_step_sm120, "Execute one decode step (graph-capturable)");
+    m.def("pythia_destroy_graph_context", &pythia_destroy_graph_context_sm120, "Destroy graph context");
 }
 #endif
