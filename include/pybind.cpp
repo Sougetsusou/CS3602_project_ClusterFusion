@@ -215,6 +215,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_6b9_graph_decode_
 
 void pythia_6b9_destroy_graph_context_sm120(int64_t context_id);
 
+// Pythia-2.8B Split kernel (Attention + MLP Up, then MLP Down)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_2b8_decoder_layer_split_sm120(
+    torch::Tensor input,
+    torch::Tensor weight_qkv,
+    torch::Tensor bias_qkv,
+    torch::Tensor weight_o,
+    torch::Tensor bias_o,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor layernorm_weight,
+    torch::Tensor layernorm_bias,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    torch::Tensor post_ln_weight,
+    torch::Tensor post_ln_bias,
+    torch::Tensor mlp_up_weight,
+    torch::Tensor mlp_up_bias,
+    torch::Tensor mlp_down_weight,
+    torch::Tensor mlp_down_bias,
+    int64_t current_seq_len
+);
+
 #ifdef COMPILE_SM90
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("llama_decoder_layer", &llama_decoder_layer_sm90, "");
@@ -232,6 +254,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     // Pythia-2.8B
     m.def("pythia_2b8_decoder_layer", &pythia_2b8_decoder_layer_sm120, "Pythia-2.8B decoder layer");
+    m.def("pythia_2b8_decoder_layer_split", &pythia_2b8_decoder_layer_split_sm120, "Pythia-2.8B decoder layer (split kernel)");
     m.def("pythia_2b8_create_graph_context", &pythia_2b8_create_graph_context_sm120, "Create graph context for Pythia-2.8B");
     m.def("pythia_2b8_graph_decode_step", &pythia_2b8_graph_decode_step_sm120, "Graph decode step for Pythia-2.8B");
     m.def("pythia_2b8_destroy_graph_context", &pythia_2b8_destroy_graph_context_sm120, "Destroy graph context for Pythia-2.8B");

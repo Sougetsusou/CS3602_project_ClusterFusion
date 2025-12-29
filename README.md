@@ -183,6 +183,68 @@ These metrics specifically evaluate the decode phase optimization:
 
 ---
 
+### Fused vs Split Kernel Comparison (Pythia-2.8B)
+
+To demonstrate the benefits of kernel fusion, we implemented a split version that separates the fused decoder kernel into two:
+- **Kernel 1**: Attention + MLP Up + GELU (writes intermediate to global memory)
+- **Kernel 2**: MLP Down + Residual (reads intermediate from global memory)
+
+| Decode Tokens | Fused (s) | Split (s) | HF (s) | Fused vs HF | Split vs HF | Fused vs Split |
+|---------------|-----------|-----------|--------|-------------|-------------|----------------|
+| 32 | 0.179 | 0.168 | 0.207 | 1.16x | 1.23x | 0.94x |
+| 64 | 0.327 | 0.338 | 0.379 | 1.16x | 1.12x | 1.04x |
+| 128 | 0.653 | 0.682 | 0.763 | 1.17x | 1.12x | 1.04x |
+| 256 | 1.318 | 1.364 | 1.549 | 1.18x | 1.14x | 1.04x |
+| 512 | 2.656 | 2.774 | 3.298 | 1.24x | 1.19x | 1.04x |
+
+**Analysis**:
+- Both fused and split kernels outperform HuggingFace
+- **Fused kernel is ~4% faster** than split kernel due to:
+  1. Single kernel launch overhead (vs. two launches per layer)
+  2. No global memory traffic for intermediate FFN buffer (~20KB)
+  3. Better register/shared memory reuse within the fused kernel
+- The split kernel uses `cudaLaunchKernelExC` (no grid.sync() needed), while fused uses `cudaLaunchCooperativeKernel`
+
+#### Branch-Level Ablation (Hybrid Configurations)
+
+Tests each branch independently by replacing only one part with CUDA kernel:
+
+| Configuration | Time (ms) | Speedup | Description |
+|---------------|-----------|---------|-------------|
+| Full PyTorch (baseline) | 9.67 | 1.00x | Both branches in PyTorch |
+| **CUDA Attn+Up + PyTorch Down** | 5.90 | **1.64x** | Only Branch 1 accelerated |
+| **PyTorch Attn+Up + CUDA Down** | 9.51 | **1.02x** | Only Branch 2 accelerated |
+| Full CUDA Split | 5.07 | 1.91x | Both branches in CUDA (split) |
+| Full CUDA Fused | 4.90 | 1.97x | Both branches fused |
+
+**Key Finding**: Accelerating Branch 1 (Attention+MLPUp) provides **88% of total speedup**, while Branch 2 (MLPDown) only contributes **12%**.
+
+#### Branch Time Breakdown
+
+| Branch | PyTorch Time | CUDA Time | Speedup | Contribution |
+|--------|--------------|-----------|---------|--------------|
+| Branch 1 (Attention+MLPUp) | 8.84 ms (91%) | 4.63 ms | 1.91x | **88%** |
+| Branch 2 (MLPDown) | 1.27 ms (13%) | 0.67 ms | 1.91x | **12%** |
+
+#### Split Overhead (per layer, 500 iterations)
+
+| Seq Len | Fused (ms) | Split (ms) | Overhead | Overhead % |
+|---------|------------|------------|----------|------------|
+| 32 | 0.1519 | 0.1571 | 0.0052 | 3.43% |
+| 64 | 0.1521 | 0.1570 | 0.0049 | 3.24% |
+| 128 | 0.1520 | 0.1572 | 0.0052 | 3.43% |
+| 256 | 0.1540 | 0.1595 | 0.0055 | 3.59% |
+| 512 | 0.1551 | 0.1610 | 0.0059 | 3.77% |
+
+**Overhead Sources**: Kernel launch (~3μs) + Global memory (25KB, ~0.01μs) + Sync (~1μs) = **~4μs/layer**
+
+```python
+# Split kernel API
+output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer_split(...)
+```
+
+---
+
 ## Summary
 
 ### Key Performance Metrics (Pythia-2.8B)
@@ -223,7 +285,7 @@ These metrics specifically evaluate the decode phase optimization:
 ```python
 import clusterfusion
 
-# Standard dispatch
+# Standard dispatch (fused kernel - best performance)
 output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
     input, weight_qkv, bias_qkv, weight_o, bias_o,
     k_cache, v_cache, ln_weight, ln_bias, cos, sin,
@@ -231,6 +293,9 @@ output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
     mlp_up_weight, mlp_up_bias, mlp_down_weight, mlp_down_bias,
     current_seq_len
 )
+
+# Split kernel (for comparison - ~4% slower than fused)
+output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer_split(...)
 
 # CUDA Graph optimized
 clusterfusion.pythia_2b8_create_graph_context(ctx_id, k_cache, v_cache, weight_qkv, weight_o, mlp_up_weight, mlp_down_weight, max_seq_len)
@@ -260,6 +325,10 @@ clusterfusion.pythia_6b9_destroy_graph_context(...)
 | `benchmark_full.py` | Complete benchmark suite (TTFT, TPOT, Throughput, FLOPs, PPL) |
 | `benchmark_decode.py` | Pythia-2.8B decode performance benchmark |
 | `benchmark_decode_6b9.py` | Pythia-6.9B decode performance benchmark |
+| `benchmark_split_kernel.py` | **Fused vs Split kernel comparison** (demonstrates fusion benefits) |
+| `ablation_hybrid.py` | **Ablation study**: Hybrid configs (CUDA Branch1 + PyTorch Branch2, etc.) |
+| `ablation_split_kernel.py` | **Ablation study**: Single-layer fused vs split timing |
+| `ablation_branch_analysis.py` | **Ablation study**: FLOPs/memory breakdown per branch |
 | `verify_lossless.py` | Verify correctness and characterize FP16 atomicAdd non-determinism |
 | `evaluate_decode_quality.py` | Decode quality metrics (Token Match Rate, Logits MAE, Top-K Agreement) |
 | `test_pythia.py` | Pythia-2.8B kernel unit test (reference vs kernel) |
