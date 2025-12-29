@@ -1,113 +1,118 @@
-# CS3602 Project: ClusterFusion - Attention-Only Branch
+# CS3602 Project: ClusterFusion for Pythia-2.8B
 
-This branch contains **Attention + MLP Up + GELU acceleration** for Pythia-2.8B.
+This project implements a CUDA-accelerated decoder layer for EleutherAI Pythia-2.8B model, focusing on the **Attention + MLP Up + GELU** computation path.
 
-The MLP Down projection is handled separately in the `mlp-only` branch.
+## Supported Model
 
-## What This Branch Contains
+| Model | Architecture | Status |
+|-------|--------------|--------|
+| **Pythia-2.8B** | GPT-NeoX | ✅ Optimized |
 
-| Component | Implementation | Status |
-|-----------|----------------|--------|
-| LayerNorm → QKV → RoPE → Attention → Output Proj | ✅ CUDA Kernel | Accelerated |
-| Post-LN → MLP Up → GELU | ✅ CUDA Kernel | Accelerated |
-| MLP Down Projection | PyTorch | Not accelerated (see `mlp-only` branch) |
+## What's Accelerated
 
-## Architecture
+The following operations are fused into a single CUDA kernel:
 
-```
-Input → [CUDA: LayerNorm → QKV → RoPE → Attention → Output Proj]
-     → [CUDA: Post-LN → MLP Up → GELU]
-     → [PyTorch: MLP Down → Residual] → Output
-```
+| Operation | Status | Description |
+|-----------|--------|-------------|
+| LayerNorm | ✅ CUDA | Pre-attention normalization |
+| QKV Projection | ✅ CUDA | Query, Key, Value computation |
+| RoPE | ✅ CUDA | Rotary Position Embedding |
+| Flash Decoding | ✅ CUDA | Memory-efficient attention |
+| Output Projection | ✅ CUDA | Attention output |
+| Post-LayerNorm | ✅ CUDA | Pre-MLP normalization |
+| MLP Up + GELU | ✅ CUDA | First MLP layer with activation |
+| MLP Down | PyTorch | Second MLP layer (simple matmul) |
 
-## API
+## Performance Results
 
-```python
-import clusterfusion
+Benchmarked on NVIDIA RTX 5090 (sm_120), batch=1, seq_len=64:
 
-# Attention-Only kernel
-# Returns: attn_output, mlp_intermediate, k_new, v_new
-attn_output, mlp_intermediate, k_new, v_new = clusterfusion.pythia_2b8_attention_only(
-    input,              # [1, 1, hidden_dim]
-    weight_qkv, bias_qkv,
-    weight_o, bias_o,
-    k_cache, v_cache,   # KV cache
-    ln_weight, ln_bias,
-    cos, sin,           # RoPE embeddings
-    post_ln_weight, post_ln_bias,
-    mlp_up_weight, mlp_up_bias,
-    current_seq_len
-)
+| Metric | PyTorch | ClusterFusion | Speedup |
+|--------|---------|---------------|---------|
+| Time per layer | 0.27 ms | 0.15 ms | **1.8x** |
+| 32 layers total | 8.84 ms | 4.63 ms | **1.91x** |
 
-# Complete forward with PyTorch MLP Down
-mlp_down = F.linear(mlp_intermediate, mlp_down_weight, mlp_down_bias)
-output = input + attn_output + mlp_down  # Parallel residual
-```
-
-## Ablation Results (from full fusion experiments)
-
-The Attention+MLPUp branch contributes approximately **88% of total speedup**:
-
-| Configuration | Time (ms) | Speedup |
-|---------------|-----------|---------|
-| Full PyTorch | 9.67 | 1.00x |
-| CUDA Attn+Up + PyTorch Down | 5.90 | **1.64x** |
-| Full CUDA Fused | 4.90 | 1.97x |
-
-**Key Finding**: Accelerating Attention+MLPUp provides the majority of speedup because:
-1. It accounts for ~91% of total execution time
-2. QKV projection, Output projection, and MLP Up are large matrix operations
-3. Flash Decoding is compute-intensive
-
-## Branch Time Breakdown
-
-| Branch | PyTorch Time | Contribution to Speedup |
-|--------|--------------|-------------------------|
-| Attention + MLP Up | 8.84 ms (91%) | **88%** |
-| MLP Down | 1.27 ms (13%) | 12% |
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `kernel_attention.cuh` | Attention + MLP Up kernel implementation |
-| `pythia_attention_dispatch.cu` | Kernel dispatch for attention-only |
-| `tests/test_attention_only.py` | Test and benchmark for attention kernel |
-
-## Build & Test
+## Quick Start
 
 ```bash
-# Install
+# Environment setup
+conda create -n nlp_project python=3.13 -y
+conda activate nlp_project
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install transformers accelerate
+
+# Build & Install
 pip install -e .
 
 # Test
 python tests/test_attention_only.py
 ```
 
-## Related Branches
+## API Usage
 
-| Branch | Description |
-|--------|-------------|
-| `main` | Attention-only acceleration (this branch) |
-| `mlp-only` | MLP-only acceleration |
-| `full-fusion-backup` | Complete fused kernel (Attention + MLP) |
+```python
+import clusterfusion
+import torch.nn.functional as F
+
+# CUDA kernel: Attention + MLP Up + GELU
+attn_output, mlp_intermediate, k_new, v_new = clusterfusion.pythia_2b8_attention_only(
+    hidden_states,          # [1, 1, 2560]
+    qkv_weight, qkv_bias,   # QKV projection
+    o_weight, o_bias,       # Output projection
+    k_cache, v_cache,       # KV cache
+    ln_weight, ln_bias,     # LayerNorm
+    cos, sin,               # RoPE embeddings
+    post_ln_weight, post_ln_bias,
+    mlp_up_weight, mlp_up_bias,
+    current_seq_len
+)
+
+# Complete the layer with PyTorch MLP Down
+mlp_output = F.linear(mlp_intermediate, mlp_down_weight, mlp_down_bias)
+output = hidden_states + attn_output + mlp_output  # Parallel residual
+```
 
 ## Key Optimizations
 
-1. **Fused LayerNorm + QKV Projection**: Single pass with online normalization
-2. **RoPE in Registers**: Rotary position embedding applied in-place
-3. **Flash Decoding**: Online softmax with running max for numerical stability
-4. **TMA Weight Loading**: Hardware-accelerated tensor memory access
-5. **Cluster-level Reduction**: Distributed atomicAdd across SM cluster
+1. **Kernel Fusion**: All attention operations in a single kernel launch
+2. **TMA Weight Loading**: Hardware-accelerated tensor memory access
+3. **Flash Decoding**: Online softmax with numerical stability
+4. **Cluster-level Reduction**: Efficient cross-block communication
+5. **PTX GELU**: Fast approximation using hardware intrinsics
 
-## Next Steps for Attention Optimization
+## Model Configuration
 
-Potential improvements:
-1. Fuse with MLP Down for complete layer fusion (see `full-fusion-backup`)
-2. Multi-query attention support
-3. Paged KV cache support
-4. Speculative decoding integration
+| Parameter | Value |
+|-----------|-------|
+| Hidden Size | 2560 |
+| Attention Heads | 32 |
+| Head Dimension | 80 |
+| FFN Dimension | 10240 |
+| Layers | 32 |
 
----
+## Files
 
-For the complete fused implementation, see `full-fusion-backup` branch.
+| File | Description |
+|------|-------------|
+| `include/5090/pythia_2b8/kernel_attention.cuh` | CUDA kernel implementation |
+| `include/5090/pythia_2b8/pythia_attention_dispatch.cu` | Kernel dispatch |
+| `tests/test_attention_only.py` | Test and benchmark |
+
+## Requirements
+
+- Python 3.13+
+- PyTorch 2.0+ with CUDA
+- NVIDIA GPU with sm_120 compute capability
+- CUDA 12.8+
+
+## Citation
+
+```bibtex
+@misc{luo2025clusterfusion,
+      title={ClusterFusion: Expanding Operator Fusion Scope for LLM Inference},
+      author={Xinhao Luo et al.},
+      year={2025},
+      eprint={2508.18850},
+      archivePrefix={arXiv}
+}
+```
