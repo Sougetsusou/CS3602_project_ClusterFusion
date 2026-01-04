@@ -1,0 +1,3 @@
+This is a sample text from PG19 for testing purposes.
+The script will use this file instead of trying to download the full dataset.
+You can replace this with any text file for testing.
