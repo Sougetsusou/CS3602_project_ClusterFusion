@@ -85,11 +85,19 @@ python benchmarks/benchmark_pythia_mini_flash.py
 
 | Prompt Len | Eager Prefill (ms) | FlashAttn-2 Prefill (ms) | MiniFlash Prefill (ms) | Eager PeakMem | Flash PeakMem | Mini PeakMem |
 |---:|---:|---:|---:|---:|---:|---:|
-| 512  | 21.46 | 19.87 | 64.59 | 5.28 GiB | 5.23 GiB | 5.23 GiB |
-| 1024 | 55.21 | 35.54 | 224.51 | 5.53 GiB | 5.28 GiB | 5.28 GiB |
-| 2048 | 155.85 | 62.73 | 847.15 | 6.51 GiB | 5.38 GiB | 5.38 GiB |
+| 512  | 21.40 | 19.73 | 65.43 | 5.28 GiB | 5.23 GiB | 5.23 GiB |
+| 1024 | 55.12 | 35.44 | 226.24 | 5.53 GiB | 5.28 GiB | 5.28 GiB |
+| 2048 | 155.62 | 62.57 | 844.32 | 6.51 GiB | 5.38 GiB | 5.38 GiB |
 | 4096 | 512.94 | 128.02 | 3320.25 | 10.37 GiB | 5.58 GiB | 5.58 GiB |
 | 8192 | OOM | 283.68 | 13106.22 | — | 5.98 GiB | 5.98 GiB |
+
+#### 3.2 Time-to-First-Token (TTFT) results (bf16)
+
+| Prompt Len | Eager TTFT (ms) | FlashAttn-2 TTFT (ms) | MiniFlash TTFT (ms) |
+|---:|---:|---:|---:|
+| 512  | 56.27 | 38.96 | 73.67 |
+| 1024 | 69.09 | 46.21 | 231.84 |
+| 2048 | 164.66 | 76.04 | 851.10 |
 
 These numbers are a representative run on a single NVIDIA GPU (31 GiB VRAM). FlashAttention-2 achieves increasing speedups with sequence length while keeping memory usage flat, whereas MiniFlash reproduces the memory benefit but is slower due to the lack of fused CUDA kernels.
 

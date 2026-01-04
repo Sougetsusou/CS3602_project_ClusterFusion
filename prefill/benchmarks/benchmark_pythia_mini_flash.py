@@ -101,12 +101,33 @@ def make_inputs(tokenizer, prompt_len: int) -> Tuple[torch.Tensor, torch.Tensor]
     return input_ids, attention_mask
 
 
-def prefill_time_and_mem(model, input_ids, attention_mask) -> Tuple[float, Optional[int]]:
+def prefill_time_and_mem(model, input_ids, attention_mask):
+    """Return (ms, peak_mem_bytes)."""
     reset_peak()
     cuda_sync()
     t0 = time.time()
     with torch.no_grad():
         _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    cuda_sync()
+    t1 = time.time()
+    return (t1 - t0) * 1000.0, peak_alloc()
+
+
+def measure_ttft(model, input_ids, attention_mask) -> Tuple[float, Optional[int]]:
+    """Measure Time To First Token (TTFT) = prefill + 1 token generation.
+    
+    Returns:
+        (ttft_ms, peak_mem_bytes)
+    """
+    reset_peak()
+    cuda_sync()
+    t0 = time.time()
+    with torch.no_grad():
+        # Prefill
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        # Generate 1 token
+        next_token = torch.ones((input_ids.shape[0], 1), dtype=torch.long, device=input_ids.device) * 42  # Dummy token ID
+        _ = model(input_ids=next_token, past_key_values=outputs.past_key_values, use_cache=False)
     cuda_sync()
     t1 = time.time()
     return (t1 - t0) * 1000.0, peak_alloc()
@@ -169,6 +190,10 @@ def bench_config(name: str, attn_impl: str, patch: bool, prompt_len: int) -> Dic
         times.append(t_ms)
         peaks.append(p)
 
+    # TTFT (prefill + 1 token)
+    ttft_ms, ttft_peak = measure_ttft(model, input_ids, attention_mask)
+
+
     ppl = prompt_ppl(model, input_ids, attention_mask)
 
     del model
@@ -186,6 +211,8 @@ def bench_config(name: str, attn_impl: str, patch: bool, prompt_len: int) -> Dic
         "prefill_ms_std": float(np.std(times)),
         "peak_mem_bytes_max": peak,
         "ppl": ppl,
+        "ttft_ms": ttft_ms,
+        "ttft_peak_mem": ttft_peak,
     }
 
 
@@ -232,11 +259,11 @@ def main():
         # Print table
         print("\n--- Results ---")
         print("-" * 110)
-        print(f"| {'Config':<22} | {'Prefill ms':>12} | {'Std':>8} | {'PeakMem':>12} | {'PPL':>10} |")
+        print(f"| {'Config':<22} | {'Prefill ms':>12} | {'Std':>8} | {'PeakMem':>10} | {'TTFT ms':>10} | {'PPL':>10} |")
         print("-" * 110)
         for r in results:
             print(
-                f"| {r['name']:<22} | {r['prefill_ms_mean']:>12.2f} | {r['prefill_ms_std']:>8.2f} | {fmt_bytes(r['peak_mem_bytes_max']):>12} | {r['ppl']:>10.6f} |"
+                f"| {r['name']:<22} | {r['prefill_ms_mean']:>12.2f} | {r['prefill_ms_std']:>8.2f} | {fmt_bytes(r['peak_mem_bytes_max']):>10} | {r['ttft_ms']:>10.2f} | {r['ppl']:>10.6f} |"
             )
         print("-" * 110)
 
