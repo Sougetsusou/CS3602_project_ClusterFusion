@@ -1,7 +1,0 @@
-build/
-clusterfusion.egg-info/
-dist/
-*.DS_Store
-*.so
-__pycache__/
-*.log

@@ -1,5 +1,0 @@
-include README.md
-recursive-include include *.cpp
-recursive-include include *.cu
-recursive-include include *.cuh
-recursive-include include *.h
